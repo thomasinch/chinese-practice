@@ -7,7 +7,7 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     input, textarea, button, select { margin: 5px 0; width: 100%; padding: 8px; box-sizing: border-box; }
-    #transcript { height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; }
+    #transcript { height: 220px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; }
     #controls { margin-bottom: 15px; }
   </style>
 </head>
@@ -32,110 +32,131 @@
     let pc, dc, audioTrack;
     let running = false;
 
-    const goBtn = document.getElementById('goBtn');
-    const apiKeyInput = document.getElementById('apiKey');
-    const scenarioInput = document.getElementById('scenario');
-    const transcriptDiv = document.getElementById('transcript');
-    const modeSelect = document.getElementById('mode');
+    const goBtn     = document.getElementById('goBtn');
+    const apiKeyEl  = document.getElementById('apiKey');
+    const scenarioEl= document.getElementById('scenario');
+    const transcript= document.getElementById('transcript');
+    const modeEl    = document.getElementById('mode');
     const userInput = document.getElementById('userInput');
-    const sendBtn = document.getElementById('sendBtn');
-    const audioOut = document.getElementById('audioOut');
+    const sendBtn   = document.getElementById('sendBtn');
+    const audioOut  = document.getElementById('audioOut');
 
-    function log(msg, obj) {
-      console.log(msg, obj || '');
+    function log(msg, obj) { console.log(msg, obj || ''); }
+
+    function appendLine(who, text) {
+      transcript.insertAdjacentHTML('beforeend', `<div><strong>${who}:</strong> ${text}</div>`);
+      transcript.scrollTop = transcript.scrollHeight;
     }
 
-    async function startSession() {
-      const apiKey = apiKeyInput.value.trim();
-      const scenario = scenarioInput.value.trim();
-      const mode = modeSelect.value;
-      if (!apiKey || !scenario) return alert('Provide API key and scenario');
+    function sendEvent(evt) {
+      evt.event_id = 'evt_' + Date.now();
+      log('Sending event', evt);
+      dc.send(JSON.stringify(evt));
+    }
 
-      log('Initializing RTCPeerConnection');
+    function handleServerEvent(event) {
+      log('Event from server', event);
+      switch (event.type) {
+        case 'response.text.delta':
+          appendLine('Teacher', event.delta);
+          break;
+        case 'response.done':
+          if (event.response?.output?.[0]?.text) {
+            appendLine('Teacher', event.response.output[0].text);
+          }
+          break;
+      }
+    }
+
+    async function createPeerConnection(mode) {
       pc = new RTCPeerConnection();
       dc = pc.createDataChannel('oai-events');
-
-      dc.onmessage = (e) => handleServerEvent(JSON.parse(e.data));
-      dc.onopen = () => log('Data channel open');
-
-      pc.ontrack = e => {
-        log('Received audio track', e);
-        audioOut.srcObject = e.streams[0];
-      };
+      dc.addEventListener('message', e => handleServerEvent(JSON.parse(e.data)));
+      dc.addEventListener('open', () => log('Data channel open'));
+      pc.addEventListener('track', e => { audioOut.srcObject = e.streams[0]; });
 
       if (mode === 'voice') {
         const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioTrack = ms.getTracks()[0];
         pc.addTrack(audioTrack, ms);
       }
+      return pc;
+    }
+
+    async function startSession() {
+      const apiKey  = apiKeyEl.value.trim();
+      const scenario= scenarioEl.value.trim();
+      const mode    = modeEl.value;
+      if (!apiKey || !scenario) return alert('Provide API key and scenario');
+
+      transcript.innerHTML = '';
+      if (mode === 'text') {
+        userInput.style.display = 'block';
+        sendBtn.style.display  = 'block';
+      } else {
+        audioOut.style.display = 'block';
+      }
+
+      await createPeerConnection(mode);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       log('Local description set', offer);
 
-      const url = 'https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
-      const resp = await fetch(url, {
+      const resp = await fetch(`https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`, {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer ' + apiKey,
-          'Content-Type': 'application/sdp'
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/sdp',
+          'OpenAI-Beta': 'realtime=v1'
         },
         body: offer.sdp
       });
+
+      if (!resp.ok) {
+        const errTxt = await resp.text();
+        console.error('Realtime API error', resp.status, errTxt);
+        alert(`Realtime API error ${resp.status}: ${errTxt}`);
+        stopSession();
+        return;
+      }
+
       const answerSdp = await resp.text();
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
       log('Remote description set');
 
-      // Session update with system prompt
-      const sysInstructions = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:
-- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.
-- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.
-- Steer conversation toward previously learned grammar and vocab.
-- If the learner says "word是什么？", give the English meaning.
-- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.
-- Begin now with the scenario the learner provided.`;
-      sendEvent({ type: 'session.update', session: { instructions: sysInstructions + '\nScenario: ' + scenario, } });
-      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: scenario }] } });
-      sendEvent({ type: 'response.create', response: { modalities: [ mode === 'text' ? 'text' : 'text', ...(mode === 'voice' ? ['audio'] : []) ] } });
+      const baseInstructions = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:\n- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.\n- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.\n- Steer conversation toward previously learned grammar and vocab.\n- If the learner says "word是什么？", give the English meaning.\n- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.\n- Begin now with the scenario the learner provided.`;
 
-      transcriptDiv.innerHTML = '';
-      if (mode === 'text') {
-        userInput.style.display = 'block';
-        sendBtn.style.display = 'block';
-      }
-      if (mode === 'voice') audioOut.style.display = 'block';
+      sendEvent({
+        type: 'session.update',
+        session: { instructions: `${baseInstructions}\nScenario: ${scenario}` }
+      });
+
+      sendEvent({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: scenario }]
+        }
+      });
+
+      sendEvent({
+        type: 'response.create',
+        response: {
+          modalities: mode === 'voice' ? ['text', 'audio'] : ['text']
+        }
+      });
     }
 
     function stopSession() {
       log('Stopping session');
       if (audioTrack) audioTrack.stop();
       if (pc) pc.close();
-      pc = null;
-      dc = null;
+      pc = dc = audioTrack = null;
       userInput.style.display = 'none';
       sendBtn.style.display = 'none';
       audioOut.style.display = 'none';
-    }
-
-    function sendEvent(evt) {
-      evt.event_id = 'evt_' + Date.now();
-      console.log('Sending event', evt);
-      dc.send(JSON.stringify(evt));
-    }
-
-    function handleServerEvent(event) {
-      console.log('Event from server', event);
-      switch(event.type) {
-        case 'response.text.delta':
-          transcriptDiv.innerHTML += `<div><strong>Teacher:</strong> ${event.delta}</div>`;
-          break;
-        case 'response.done':
-          const text = event.response.output[0].text || '';
-          transcriptDiv.innerHTML += `<div><strong>Teacher:</strong> ${text}</div>`;
-          break;
-        // handle other events as needed
-      }
-      transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
     }
 
     goBtn.onclick = () => {
@@ -153,11 +174,17 @@
     sendBtn.onclick = () => {
       const txt = userInput.value.trim();
       if (!txt) return;
-      transcriptDiv.innerHTML += `<div><strong>You:</strong> ${txt}</div>`;
-      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: txt }] } });
+      appendLine('You', txt);
+      sendEvent({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: txt }]
+        }
+      });
       sendEvent({ type: 'response.create', response: { modalities: ['text'] } });
       userInput.value = '';
-      transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
     };
   </script>
 </body>
