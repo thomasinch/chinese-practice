@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Chinese Conversational Practice</title>
+  <style>
+    :root { --bg:#f5f5f5; --card:#ffffff; --border:#d0d0d0; }
+    * { box-sizing: border-box; }
+    body {
+      margin:0; padding:1rem; font-family:Arial, sans-serif; background:var(--bg);
+    }
+    .container { max-width:900px; margin:auto; }
+    h1 { margin-top:0; }
+    label { display:block; margin:.75rem 0 .25rem; font-weight:600; }
+    textarea,input[type=text],input[type=password] {
+      width:100%; padding:.5rem; border:1px solid var(--border); border-radius:4px;
+    }
+    button { margin-top:1rem; padding:.65rem 1.25rem; border:none; border-radius:4px; background:#007bff; color:#fff; font-size:1rem; cursor:pointer; }
+    button[disabled] { opacity:.5; cursor:not-allowed; }
+    #transcript, #log {
+      background:var(--card); border:1px solid var(--border); border-radius:4px; margin-top:1rem; padding:1rem; height:220px; overflow:auto; white-space:pre-line; font-size:.95rem;
+    }
+    #log { height:120px; color:#c7254e; }
+    #controls { display:flex; gap:1rem; margin-top:.75rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Chinese Speaking Practice (Realtime)</h1>
+
+    <label for="apiKey">OpenAI API Key</label>
+    <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
+
+    <label for="scenario">Practice scenario</label>
+    <textarea id="scenario" rows="3" placeholder="Describe the situation you want to practice..."></textarea>
+
+    <button id="startBtn">Go</button>
+
+    <div id="controls" style="display:none;">
+      <label><input type="checkbox" id="showText" checked /> Show Text</label>
+      <label><input type="checkbox" id="playAudio" checked /> Play Audio</label>
+    </div>
+
+    <div id="transcript" style="display:none;"></div>
+    <div id="log" style="display:none;"></div>
+
+    <audio id="assistantAudio" autoplay></audio>
+  </div>
+
+<script>
+  // --------------------------------------------------------
+  // Utility helpers
+  // --------------------------------------------------------
+  const $ = sel => document.querySelector(sel);
+  function log(msg) {
+    const logDiv = $('#log');
+    logDiv.style.display = 'block';
+    logDiv.textContent += `\n${msg}`;
+    logDiv.scrollTop = logDiv.scrollHeight;
+  }
+
+  // --------------------------------------------------------
+  // Main flow
+  // --------------------------------------------------------
+  let pc, dc;
+  const modelId = 'gpt-4o-realtime-preview-2024-12-17'; // update to latest when GA
+
+  $('#startBtn').addEventListener('click', async () => {
+    $('#startBtn').disabled = true;
+    try {
+      await startSession();
+    } catch(err) {
+      alert(err.message || err);
+      log(`Error: ${err}`);
+      console.error(err);
+      $('#startBtn').disabled = false;
+    }
+  });
+
+  async function startSession() {
+    // ------------ basic checks -----------------
+    const apiKey = $('#apiKey').value.trim();
+    const scenario = $('#scenario').value.trim();
+    if(!apiKey) throw new Error('API key missing');
+    if(!scenario) throw new Error('Scenario missing');
+    if(location.protocol === 'file:') {
+      throw new Error('Please run this page from http://localhost or https:// – WebRTC & microphone do not work from file://');
+    }
+
+    // ------------ UI tweaks --------------------
+    $('#controls').style.display = 'flex';
+    $('#transcript').style.display = 'block';
+    $('#log').textContent='';
+
+    // ------------ microphone capture -----------
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    } catch(err) {
+      throw new Error('Microphone permission denied or unavailable.');
+    }
+
+    // ------------ WebRTC setup -----------------
+    pc = new RTCPeerConnection();
+    pc.addTrack(stream.getTracks()[0]);
+
+    // remote audio
+    pc.ontrack = e => {
+      if($('#playAudio').checked) $('#assistantAudio').srcObject = e.streams[0];
+    };
+
+    pc.oniceconnectionstatechange = () => log(`ICE state: ${pc.iceConnectionState}`);
+    pc.onconnectionstatechange  = () => log(`Peer state: ${pc.connectionState}`);
+
+    // data channel
+    dc = pc.createDataChannel('oai-events');
+    dc.addEventListener('open', () => log('Data channel open ✔'));
+    dc.addEventListener('close', () => log('Data channel closed'));
+    dc.addEventListener('error', err => log(`DC error: ${err}`));
+    dc.addEventListener('message', onServerEvent);
+
+    // ---- create offer & send to OpenAI --------
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    let answerText;
+    try {
+      const resp = await fetch(`https://api.openai.com/v1/realtime?model=${modelId}`, {
+        method:'POST',
+        body:offer.sdp,
+        headers:{
+          'Authorization':`Bearer ${apiKey}`,
+          'Content-Type':'application/sdp',
+          'OpenAI-Beta':'realtime=v1' // required during beta
+        }
+      });
+      if(!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`Realtime API HTTP ${resp.status}: ${txt}`);
+      }
+      answerText = await resp.text();
+    } catch(err) {
+      throw new Error('Failed to create session. Check that your key has access to the Realtime API and you are online.');
+    }
+
+    await pc.setRemoteDescription({type:'answer', sdp:answerText});
+
+    // UI listeners
+    $('#showText').addEventListener('change', e => {
+      $('#transcript').style.display = e.target.checked ? 'block' : 'none';
+    });
+    $('#playAudio').addEventListener('change', e => {
+      $('#assistantAudio').muted = !e.target.checked;
+    });
+  }
+
+  // --------------------------------------------------------
+  // OpenAI Realtime handling
+  // --------------------------------------------------------
+  function onServerEvent(ev) {
+    const event = JSON.parse(ev.data);
+    // uncomment next line for verbose logging
+    // log(`[srv] ${event.type}`);
+
+    if(event.type === 'session.created') {
+      initialiseConversation();
+    }
+    else if(event.type === 'response.text.delta') {
+      appendText(event.delta);
+    }
+    else if(event.type === 'response.text.done') {
+      appendText('\n');
+    }
+    else if(event.type === 'error') {
+      log(`Server error: ${event.message || JSON.stringify(event)}`);
+    }
+  }
+
+  function appendText(txt) {
+    const tr = $('#transcript');
+    tr.textContent += txt;
+    tr.scrollTop = tr.scrollHeight;
+  }
+
+  function initialiseConversation() {
+    const scenario = $('#scenario').value.trim();
+    const systemPrompt = `You are a friendly Chinese teacher named 小王. Hold conversational practice with the learner:\n- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.\n- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.\n- Steer conversation toward previously learned grammar and vocab.\n- If the learner says \"word是什么？\", give the English meaning.\n- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.\n- Begin now with the scenario the learner provided.`;
+
+    // wait for data channel ready
+    if(dc.readyState !== 'open') {
+      dc.addEventListener('open', () => sendInitial(systemPrompt, scenario));
+    } else {
+      sendInitial(systemPrompt, scenario);
+    }
+  }
+
+  function sendInitial(prompt, scenario) {
+    // update session instructions + voice
+    dc.send(JSON.stringify({
+      type:'session.update',
+      session:{ instructions:prompt, voice:'alloy' }
+    }));
+
+    // add scenario as first user item
+    dc.send(JSON.stringify({
+      type:'conversation.item.create',
+      item:{
+        type:'message', role:'user',
+        content:[{type:'input_text', text:scenario}]
+      }
+    }));
+
+    // ask model to reply with audio + text
+    dc.send(JSON.stringify({
+      type:'response.create',
+      response:{ modalities:['audio','text'] }
+    }));
+
+    log('Conversation started – speak when ready!');
+  }
+</script>
+</body>
+</html>
