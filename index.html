@@ -3,165 +3,162 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chinese Practice Tool</title>
+  <title>Chinese Practice Demo</title>
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    #transcript { white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; height: 200px; overflow-y: auto; margin-top: 10px; }
-    input, textarea, select, button { width: 100%; margin-top: 5px; padding: 8px; box-sizing: border-box; }
-    #controls { display: flex; gap: 10px; }
-    #controls > * { flex: 1; }
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    input, textarea, button, select { margin: 5px 0; width: 100%; padding: 8px; box-sizing: border-box; }
+    #transcript { height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; }
+    #controls { margin-bottom: 15px; }
   </style>
 </head>
 <body>
-  <h1>Chinese Practice Tool</h1>
-  <label>OpenAI API Key:</label>
-  <input id="apiKey" type="password" placeholder="sk-..." />
-
-  <label>Practice Scenario:</label>
-  <textarea id="scenario" rows="3" placeholder="Describe your situation..."></textarea>
-
-  <label>Mode:</label>
-  <select id="mode">
-    <option value="text">Text Only</option>
-    <option value="speech">Voice Only</option>
-  </select>
-
-  <button id="toggleBtn">Go</button>
-
-  <div id="transcript" placeholder="Conversation will appear here..."></div>
-
-  <div id="textInputSection" style="display:none; margin-top:10px;">
-    <textarea id="userInput" rows="2" placeholder="Type your response..."></textarea>
-    <button id="sendBtn">Send</button>
+  <div id="controls">
+    <input id="apiKey" type="password" placeholder="OpenAI API Key" />
+    <textarea id="scenario" rows="2" placeholder="Enter practice scenario"></textarea>
+    <select id="mode">
+      <option value="text">Text Only</option>
+      <option value="voice">Voice Only</option>
+    </select>
+    <button id="goBtn">Go</button>
   </div>
 
-  <audio id="audio" autoplay style="display:none;"></audio>
+  <div id="transcript" readonly></div>
+  <textarea id="userInput" rows="2" placeholder="Type your response..." style="display:none;"></textarea>
+  <button id="sendBtn" style="display:none;">Send</button>
+
+  <audio id="audioOut" autoplay style="display:none;"></audio>
 
   <script>
-    let pc, dc, isRunning = false;
+    let pc, dc, audioTrack;
+    let running = false;
 
-    const toggleBtn = document.getElementById('toggleBtn');
-    const sendBtn = document.getElementById('sendBtn');
+    const goBtn = document.getElementById('goBtn');
+    const apiKeyInput = document.getElementById('apiKey');
+    const scenarioInput = document.getElementById('scenario');
+    const transcriptDiv = document.getElementById('transcript');
     const modeSelect = document.getElementById('mode');
+    const userInput = document.getElementById('userInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const audioOut = document.getElementById('audioOut');
 
-    toggleBtn.addEventListener('click', () => {
-      if (isRunning) stopSession(); else startSession();
-    });
-
-    sendBtn.addEventListener('click', sendTextResponse);
+    function log(msg, obj) {
+      console.log(msg, obj || '');
+    }
 
     async function startSession() {
-      isRunning = true;
-      toggleBtn.textContent = 'Stop';
-      document.getElementById('transcript').textContent = '';
-
-      const apiKey = document.getElementById('apiKey').value;
-      const scenario = document.getElementById('scenario').value;
+      const apiKey = apiKeyInput.value.trim();
+      const scenario = scenarioInput.value.trim();
       const mode = modeSelect.value;
-      console.log('Starting session in mode:', mode);
+      if (!apiKey || !scenario) return alert('Provide API key and scenario');
 
-      // Show/hide UI sections
-      document.getElementById('textInputSection').style.display = mode === 'text' ? 'block' : 'none';
-      document.getElementById('audio').style.display = mode === 'speech' ? 'block' : 'none';
-
-      // 1. Ephemeral key
-      console.log('Fetching ephemeral key...');
-      const sessRes = await fetch('https://api.openai.com/v1/realtime/sessions', {
-        method: 'POST', headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ model: 'gpt-4o-realtime-preview-2024-12-17', voice: 'verse' })
-      });
-      const sessData = await sessRes.json();
-      console.log('Session data:', sessData);
-      const token = sessData.client_secret.value;
-
-      // 2. WebRTC peer
+      log('Initializing RTCPeerConnection');
       pc = new RTCPeerConnection();
-      const audioEl = document.getElementById('audio');
-      pc.ontrack = e => { console.log('Remote track', e); audioEl.srcObject = e.streams[0]; };
-
-      if (mode === 'speech') {
-        const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-        console.log('Local mic added');
-      }
-
       dc = pc.createDataChannel('oai-events');
-      dc.onopen = () => onDataChannelOpen(scenario, mode);
-      dc.onmessage = e => handleEvent(JSON.parse(e.data));
+
+      dc.onmessage = (e) => handleServerEvent(JSON.parse(e.data));
+      dc.onopen = () => log('Data channel open');
+
+      pc.ontrack = e => {
+        log('Received audio track', e);
+        audioOut.srcObject = e.streams[0];
+      };
+
+      if (mode === 'voice') {
+        const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioTrack = ms.getTracks()[0];
+        pc.addTrack(audioTrack, ms);
+      }
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      console.log('Local SDP set');
+      log('Local description set', offer);
 
-      const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`, {
+      const url = 'https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
+      const resp = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
+          'Authorization': 'Bearer ' + apiKey,
           'Content-Type': 'application/sdp'
         },
         body: offer.sdp
       });
-      const answerSdp = await sdpRes.text();
-      console.log('Received SDP answer');
+      const answerSdp = await resp.text();
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+      log('Remote description set');
+
+      // Session update with system prompt
+      const sysInstructions = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:
+- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.
+- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.
+- Steer conversation toward previously learned grammar and vocab.
+- If the learner says "word是什么？", give the English meaning.
+- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.
+- Begin now with the scenario the learner provided.`;
+      sendEvent({ type: 'session.update', session: { instructions: sysInstructions + '\nScenario: ' + scenario, } });
+      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: scenario }] } });
+      sendEvent({ type: 'response.create', response: { modalities: [ mode === 'text' ? 'text' : 'text', ...(mode === 'voice' ? ['audio'] : []) ] } });
+
+      transcriptDiv.innerHTML = '';
+      if (mode === 'text') {
+        userInput.style.display = 'block';
+        sendBtn.style.display = 'block';
+      }
+      if (mode === 'voice') audioOut.style.display = 'block';
     }
 
     function stopSession() {
-      console.log('Stopping session');
-      isRunning = false;
-      toggleBtn.textContent = 'Go';
-      if (dc) dc.close();
+      log('Stopping session');
+      if (audioTrack) audioTrack.stop();
       if (pc) pc.close();
+      pc = null;
+      dc = null;
+      userInput.style.display = 'none';
+      sendBtn.style.display = 'none';
+      audioOut.style.display = 'none';
     }
 
-    function onDataChannelOpen(scenario, mode) {
-      console.log('Data channel open');
-      const teacherPrompt = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:\n- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.\n- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.\n- Steer conversation toward previously learned grammar and vocab.\n- If the learner says "word是什么？", give the English meaning.\n- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.\n- Begin now with the scenario the learner provided.`;
-
-      sendEvent({ type: 'session.update', session: { instructions: teacherPrompt } });
-      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: scenario }] } });
-      // Text only or Speech: set modalities
-      const modalities = mode === 'text' ? ['text'] : ['audio', 'text'];
-      sendEvent({ type: 'response.create', response: { modalities } });
+    function sendEvent(evt) {
+      evt.event_id = 'evt_' + Date.now();
+      console.log('Sending event', evt);
+      dc.send(JSON.stringify(evt));
     }
 
-    function sendTextResponse() {
-      const text = document.getElementById('userInput').value.trim();
-      if (!text) return;
-      document.getElementById('userInput').value = '';
-      appendTranscript('You', text);
-      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+    function handleServerEvent(event) {
+      console.log('Event from server', event);
+      switch(event.type) {
+        case 'response.text.delta':
+          transcriptDiv.innerHTML += `<div><strong>Teacher:</strong> ${event.delta}</div>`;
+          break;
+        case 'response.done':
+          const text = event.response.output[0].text || '';
+          transcriptDiv.innerHTML += `<div><strong>Teacher:</strong> ${text}</div>`;
+          break;
+        // handle other events as needed
+      }
+      transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+    }
+
+    goBtn.onclick = () => {
+      if (!running) {
+        running = true;
+        goBtn.textContent = 'Stop';
+        startSession();
+      } else {
+        running = false;
+        goBtn.textContent = 'Go';
+        stopSession();
+      }
+    };
+
+    sendBtn.onclick = () => {
+      const txt = userInput.value.trim();
+      if (!txt) return;
+      transcriptDiv.innerHTML += `<div><strong>You:</strong> ${txt}</div>`;
+      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: txt }] } });
       sendEvent({ type: 'response.create', response: { modalities: ['text'] } });
-    }
-
-    function handleEvent(event) {
-      console.log('Event:', event);
-      if (event.type === 'error') {
-        appendTranscript('System', event.error?.message || JSON.stringify(event.error));
-        return;
-      }
-      if (event.type === 'response.text.delta') {
-        appendTranscript('Teacher', event.delta);
-      }
-      if (event.type === 'conversation.item.input_audio_transcription.delta') {
-        appendTranscript('You', event.delta);
-      }
-      if (event.type === 'response.done') console.log('Response done');
-    }
-
-    function appendTranscript(speaker, text) {
-      const t = document.getElementById('transcript');
-      t.textContent += `\n${speaker}: ${text}`;
-      t.scrollTop = t.scrollHeight;
-    }
-
-    function sendEvent(event) {
-      console.log('Sending:', event);
-      dc.send(JSON.stringify(event));
-    }
+      userInput.value = '';
+      transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+    };
   </script>
 </body>
 </html>
