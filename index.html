@@ -7,8 +7,9 @@
   <style>
     body { font-family: sans-serif; margin: 20px; }
     #transcript { white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; height: 200px; overflow-y: auto; margin-top: 10px; }
-    input, textarea, select { width: 100%; margin-top: 5px; padding: 8px; box-sizing: border-box; }
-    button { margin-top: 10px; padding: 10px 20px; }
+    input, textarea, select, button { width: 100%; margin-top: 5px; padding: 8px; box-sizing: border-box; }
+    #controls { display: flex; gap: 10px; }
+    #controls > * { flex: 1; }
   </style>
 </head>
 <body>
@@ -21,120 +22,143 @@
 
   <label>Mode:</label>
   <select id="mode">
-    <option value="both">Speech & Text</option>
     <option value="text">Text Only</option>
-    <option value="speech">Speech Only</option>
+    <option value="speech">Voice Only</option>
   </select>
 
-  <button id="startBtn">Go</button>
+  <button id="toggleBtn">Go</button>
 
   <div id="transcript" placeholder="Conversation will appear here..."></div>
-  <audio id="audio" autoplay></audio>
+
+  <div id="textInputSection" style="display:none; margin-top:10px;">
+    <textarea id="userInput" rows="2" placeholder="Type your response..."></textarea>
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <audio id="audio" autoplay style="display:none;"></audio>
 
   <script>
-    let pc, dc;
+    let pc, dc, isRunning = false;
 
-    document.getElementById('startBtn').addEventListener('click', startSession);
+    const toggleBtn = document.getElementById('toggleBtn');
+    const sendBtn = document.getElementById('sendBtn');
+    const modeSelect = document.getElementById('mode');
+
+    toggleBtn.addEventListener('click', () => {
+      if (isRunning) stopSession(); else startSession();
+    });
+
+    sendBtn.addEventListener('click', sendTextResponse);
 
     async function startSession() {
+      isRunning = true;
+      toggleBtn.textContent = 'Stop';
+      document.getElementById('transcript').textContent = '';
+
       const apiKey = document.getElementById('apiKey').value;
       const scenario = document.getElementById('scenario').value;
-      const mode = document.getElementById('mode').value;
-      console.log('Starting session with mode:', mode);
+      const mode = modeSelect.value;
+      console.log('Starting session in mode:', mode);
 
-      // 1. Create ephemeral key
+      // Show/hide UI sections
+      document.getElementById('textInputSection').style.display = mode === 'text' ? 'block' : 'none';
+      document.getElementById('audio').style.display = mode === 'speech' ? 'block' : 'none';
+
+      // 1. Ephemeral key
       console.log('Fetching ephemeral key...');
       const sessRes = await fetch('https://api.openai.com/v1/realtime/sessions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ model: 'gpt-4o-realtime-preview-2024-12-17', voice: 'verse' })
+        method: 'POST', headers: {
+          'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json'
+        }, body: JSON.stringify({ model: 'gpt-4o-realtime-preview-2024-12-17', voice: 'verse' })
       });
       const sessData = await sessRes.json();
-      console.log('Ephemeral session data:', sessData);
+      console.log('Session data:', sessData);
       const token = sessData.client_secret.value;
 
-      // 2. Setup WebRTC peer connection
+      // 2. WebRTC peer
       pc = new RTCPeerConnection();
-
-      // 3. Remote audio track
       const audioEl = document.getElementById('audio');
-      pc.ontrack = e => {
-        console.log('Received remote track', e);
-        audioEl.srcObject = e.streams[0];
-      };
+      pc.ontrack = e => { console.log('Remote track', e); audioEl.srcObject = e.streams[0]; };
 
-      // 4. Local mic
-      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      console.log('Local audio track added');
+      if (mode === 'speech') {
+        const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        console.log('Local mic added');
+      }
 
-      // 5. Data channel for events
       dc = pc.createDataChannel('oai-events');
       dc.onopen = () => onDataChannelOpen(scenario, mode);
       dc.onmessage = e => handleEvent(JSON.parse(e.data));
-      console.log('Data channel created');
 
-      // 6. Create and send offer
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      console.log('Local SDP offer set');
+      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+      console.log('Local SDP set');
 
-      // 7. Send offer to OpenAI
       const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/sdp'
-        },
-        body: offer.sdp
+        method: 'POST', headers: {
+          'Authorization': `Bearer ${token}`, 'Content-Type': 'application/sdp'
+        }, body: offer.sdp
       });
       const answerSdp = await sdpRes.text();
       console.log('Received SDP answer');
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
     }
 
-    function onDataChannelOpen(scenario, mode) {
-      console.log('Data channel open, initializing session...');
-      // Send session instructions
-      const instructions = `You are a Chinese teacher. Role-play in Chinese, correcting grammar, vocabulary, pronunciation. Speak mostly Chinese, but use English when needed. Subtly steer the student to use learned structures.`;
-      sendEvent({ type: 'session.update', session: { instructions } });
-
-      // Send the user scenario
-      sendEvent({
-        type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: 'user',
-          content: [ { type: 'input_text', text: scenario } ]
-        }
-      });
-
-      // Start the response
-      let modalities;
-      if (mode === 'text') modalities = ['text'];
-      else if (mode === 'speech') modalities = ['audio'];
-      else modalities = ['audio', 'text'];
-      sendEvent({ type: 'response.create', response: { modalities } });
+    function stopSession() {
+      console.log('Stopping session');
+      isRunning = false;
+      toggleBtn.textContent = 'Go';
+      if (dc) dc.close();
+      if (pc) pc.close();
     }
 
-    function sendEvent(event) {
-      console.log('Sending event:', event);
-      dc.send(JSON.stringify(event));
+    function onDataChannelOpen(scenario, mode) {
+      console.log('Data channel open');
+      const teacherPrompt = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:
+- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.
+- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.
+- Steer conversation toward previously learned grammar and vocab.
+- If the learner says "word是什么？", give the English meaning.
+- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.
+- Begin now with the scenario the learner provided.`;
+
+      sendEvent({ type: 'session.update', session: { instructions: teacherPrompt } });
+      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: scenario }] } });
+      sendEvent({ type: 'response.create', response: { modalities: mode === 'text' ? ['text'] : ['audio'] } });
+    }
+
+    function sendTextResponse() {
+      const text = document.getElementById('userInput').value.trim();
+      if (!text) return;
+      document.getElementById('userInput').value = '';
+      appendTranscript('You', text);
+      sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+      sendEvent({ type: 'response.create', response: { modalities: ['text'] } });
     }
 
     function handleEvent(event) {
-      console.log('Received event:', event);
-      // Append text deltas to transcript
+      console.log('Event:', event);
       if (event.type === 'response.text.delta') {
-        document.getElementById('transcript').textContent += event.delta;
+        appendTranscript('Teacher', event.delta);
       }
-      // Optionally handle other event types
-      if (event.type === 'response.done') {
-        console.log('Response completed');
+      if (event.type === 'response.audio_transcript.delta') {
+        appendTranscript('Teacher', event.delta);
       }
+      if (event.type === 'conversation.item.input_audio_transcription.delta') {
+        appendTranscript('You', event.delta);
+      }
+      if (event.type === 'response.done') console.log('Response done');
+    }
+
+    function appendTranscript(speaker, text) {
+      const t = document.getElementById('transcript');
+      t.textContent += `
+${speaker}: ${text}`;
+      t.scrollTop = t.scrollHeight;
+    }
+
+    function sendEvent(event) {
+      console.log('Sending:', event);
+      dc.send(JSON.stringify(event));
     }
   </script>
 </body>
