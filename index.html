@@ -68,8 +68,10 @@
       console.log('Fetching ephemeral key...');
       const sessRes = await fetch('https://api.openai.com/v1/realtime/sessions', {
         method: 'POST', headers: {
-          'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json'
-        }, body: JSON.stringify({ model: 'gpt-4o-realtime-preview-2024-12-17', voice: 'verse' })
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model: 'gpt-4o-realtime-preview-2024-12-17', voice: 'verse' })
       });
       const sessData = await sessRes.json();
       console.log('Session data:', sessData);
@@ -90,13 +92,17 @@
       dc.onopen = () => onDataChannelOpen(scenario, mode);
       dc.onmessage = e => handleEvent(JSON.parse(e.data));
 
-      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
       console.log('Local SDP set');
 
       const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17`, {
-        method: 'POST', headers: {
-          'Authorization': `Bearer ${token}`, 'Content-Type': 'application/sdp'
-        }, body: offer.sdp
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/sdp'
+        },
+        body: offer.sdp
       });
       const answerSdp = await sdpRes.text();
       console.log('Received SDP answer');
@@ -113,17 +119,13 @@
 
     function onDataChannelOpen(scenario, mode) {
       console.log('Data channel open');
-      const teacherPrompt = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:
-- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.
-- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.
-- Steer conversation toward previously learned grammar and vocab.
-- If the learner says "word是什么？", give the English meaning.
-- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.
-- Begin now with the scenario the learner provided.`;
+      const teacherPrompt = `You are a friendly Chinese teacher named 小王. Speak slowly. Hold conversational practice with the learner:\n- Speak mostly Mandarin Chinese, sprinkling English only when necessary for comprehension.\n- Subtly correct grammar, vocabulary and pronunciation after each learner utterance.\n- Steer conversation toward previously learned grammar and vocab.\n- If the learner says "word是什么？", give the English meaning.\n- If learner asks about a grammar structure, explain briefly in English followed by a Chinese example.\n- Begin now with the scenario the learner provided.`;
 
       sendEvent({ type: 'session.update', session: { instructions: teacherPrompt } });
       sendEvent({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: scenario }] } });
-      sendEvent({ type: 'response.create', response: { modalities: mode === 'text' ? ['text'] : ['audio'] } });
+      // Text only or Speech: set modalities
+      const modalities = mode === 'text' ? ['text'] : ['audio', 'text'];
+      sendEvent({ type: 'response.create', response: { modalities } });
     }
 
     function sendTextResponse() {
@@ -137,10 +139,11 @@
 
     function handleEvent(event) {
       console.log('Event:', event);
-      if (event.type === 'response.text.delta') {
-        appendTranscript('Teacher', event.delta);
+      if (event.type === 'error') {
+        appendTranscript('System', event.error?.message || JSON.stringify(event.error));
+        return;
       }
-      if (event.type === 'response.audio_transcript.delta') {
+      if (event.type === 'response.text.delta') {
         appendTranscript('Teacher', event.delta);
       }
       if (event.type === 'conversation.item.input_audio_transcription.delta') {
@@ -151,8 +154,7 @@
 
     function appendTranscript(speaker, text) {
       const t = document.getElementById('transcript');
-      t.textContent += `
-${speaker}: ${text}`;
+      t.textContent += `\n${speaker}: ${text}`;
       t.scrollTop = t.scrollHeight;
     }
 
